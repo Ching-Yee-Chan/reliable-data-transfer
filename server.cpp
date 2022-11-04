@@ -1,16 +1,32 @@
 ﻿#include <iostream>
+#include <fstream>
+#include <io.h>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
+#include <vector>
+#define FILEPATH "D:\\数据\\作业\\寄网\\Lab3\\server\\data"
 #pragma comment(lib, "Ws2_32.lib")
 using namespace std;
 
-const int MSS = 512;
+const int MSS = 2048;
+const double LOSSRATE = 0;
 unsigned short seq = 0, ack = 0;
 unsigned short seqBase = 0;
 unsigned short ackBase = 0;
 SOCKADDR_IN addrSrv;
 SOCKADDR_IN addrClt;
 SOCKET sockSrv;
+
+//模拟丢包
+bool randomLoss()
+{
+	int lossBound = (int)(LOSSRATE * 100);
+	int r = rand() % 100;
+	if (r < lossBound) {
+		return true;
+	}
+	return false;
+}
 
 struct stop_wait_package
 {
@@ -61,7 +77,7 @@ struct stop_wait_package
 	}
 	void setFIN()
 	{
-		flags &= 0x01;
+		flags |= 0x01;
 	}
 	void setCheckSum()
 	{
@@ -123,6 +139,12 @@ struct stop_wait_package
 	}
 }sendBuf, recvBuf;
 
+//文件头结构
+struct fileHead {
+	char name[20];
+	int length;
+};
+
 sockaddr_in getLocalIP()
 {
 	char name[255];
@@ -162,16 +184,16 @@ bool establish()
 	int len = sizeof(SOCKADDR);
 	int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, &len);
 	if (recvNum < 0) {
-		cout << "接收建联请求失败，错误码：" << WSAGetLastError() << endl;
+		cout << "[error]接收建联请求失败，错误码：" << WSAGetLastError() << endl;
 		return false;
 	}
 	else if (!recvBuf.valid()) {//校验
-		cout << "接收消息有误！" << endl;
+		cout << "[error]接收消息有误！" << endl;
 		return false;
 	}
 	if (recvBuf.getSYN()) {
-		cout << "收到用户建联请求！ISN: " << recvBuf.seq << endl;
 		ack = ackBase = recvBuf.seq;
+		cout << "第一次握手" << "	" << "R" << "	" << recvBuf.seq - ackBase << "	" << recvBuf.ack - seqBase << "	" << recvBuf.checkSum << endl;
 		return true;
 	}
 	else return false;
@@ -181,12 +203,15 @@ bool sendPackage()
 {
 	while (true)
 	{
-		int status = sendto(sockSrv, (char*)&sendBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, sizeof(SOCKADDR));
-		if (status == SOCKET_ERROR) {
-			cout << "发送消息失败，即将重传！错误码：" << WSAGetLastError() << endl;
-			continue;
+		cout << "发     送" << "	" << "S" << "	" << sendBuf.seq - seqBase << "	" << sendBuf.ack - ackBase << "	" << sendBuf.checkSum << endl;
+		if (!randomLoss()) {//模拟丢包
+			int status = sendto(sockSrv, (char*)&sendBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, sizeof(SOCKADDR));
+			if (status == SOCKET_ERROR) {
+				cout << "[error]发送消息失败，即将重传！错误码：" << WSAGetLastError() << endl;
+				continue;
+			}
 		}
-		for (int i = 0; i < 10; Sleep(200), i++)
+		for (int i = 0; i < 10; Sleep(5), i++)
 		{
 			int len = sizeof(SOCKADDR);
 			int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, &len);
@@ -194,21 +219,81 @@ bool sendPackage()
 				continue;
 			}
 			if (!recvBuf.valid()) {//校验
-				cout << "接收消息有误！即将重传..." << endl;
+				cout << "[error]接收消息有误！即将重传..." << endl;
 				break;
 			}
 			if (recvBuf.getACK() && recvBuf.ack==seq) {
-				cout << "收到来自客户端的确认！ACK: " << recvBuf.ack - seqBase<< endl;
+				cout << "收     到" << "	" << "R" << "	" << recvBuf.seq - ackBase << "	" << recvBuf.ack - seqBase << "	" << recvBuf.checkSum << endl;
 				ack = recvBuf.seq;
 				return true;
 			}
 		}
-		cout << "2s未收到相应，即将超时重传..." << endl;
+		cout << "50ms未收到响应，即将超时重传..." << endl;
 	}
+}
+
+bool sendFile(string fileName)
+{
+	string path;
+	path.assign(FILEPATH).append("\\").append(fileName);
+	ifstream infile(path, ios::binary);
+	if (!infile.is_open()) {
+		cout << "文件" << fileName << "打开失败！" << endl;
+		return false;
+	}
+	//读取文件总大小
+	infile.seekg(0, ios::end);
+	int length = infile.tellg();
+	int packNum = ceil((double)length / MSS);
+	cout << "文件"<< fileName << "已读取！大小为" << length << "Bytes，共计" << packNum << "个数据包" << endl;
+	//发送文件头
+	fileHead head;
+	strcpy_s(head.name, fileName.c_str());
+	head.length = length;
+	sendBuf.reset(++seq, ack, true, false, false, (char*)&head, sizeof(head));
+	sendPackage();
+	cout << "文件头发送成功！开始传输数据..."<<endl;
+	infile.seekg(0, std::ios_base::beg);  //将文件流指针重新定位到流的开始
+	//传输文件
+	double time = 0;
+	for (int i = 1; length>0; length -= MSS, i++) {	//i计数，length记录剩余长度
+		//计时器开始
+		LARGE_INTEGER t1, t2, tc;
+		QueryPerformanceFrequency(&tc);
+		QueryPerformanceCounter(&t1);
+		infile.read(sendBuf.data, min(length, MSS));
+		sendBuf.reset(++seq, ack, true, false, false, nullptr, 0);//由于已经设置过data域，此处不再设置
+		sendPackage();
+		//计时器终止
+		QueryPerformanceCounter(&t2);
+		//cout << "第" << i << "个数据包已发送成功！" << endl;
+		time += (t2.QuadPart - t1.QuadPart) * 1.0 / tc.QuadPart;
+	}
+	cout << "文件" << fileName << "传输完成！用时" << time << "s" << endl;
 }
 
 int main()
 {
+	//======================================================STEP0: 文件读取=============================================================
+	vector<string> files;
+	intptr_t handle;
+	struct _finddata_t fileInfo;
+	string p;
+	string path = FILEPATH;
+	if ((handle = _findfirst(p.assign(path).append("\\*").c_str(), &fileInfo)) == -1) {
+		cout << "未找到待发送文件！请确认文件位于" << path << "后重试！";
+		return -1;
+	}
+	else {
+		do {
+			if (strcmp(fileInfo.name, ".") && strcmp(fileInfo.name, "..")) {//过滤"."和".."
+				cout << "找到文件：" << fileInfo.name << endl;
+ 				files.push_back(fileInfo.name);
+			}
+		} while (_findnext(handle, &fileInfo) == 0);
+		_findclose(handle);
+	}
+	//=====================================================STEP1: 建立连接==============================================================
 	WORD wVersionRequested = MAKEWORD(2, 2);
 	WSADATA wsaData;
 	int connectState = WSAStartup(wVersionRequested, &wsaData);
@@ -235,8 +320,8 @@ int main()
 	}
 	addrSrv.sin_family = AF_INET;
 	int port = 10086;
-	cout << "请输入欲使用的网络端口号：";
-	cin >> port;
+	//cout << "请输入欲使用的网络端口号：";
+	//cin >> port;
 	addrSrv.sin_port = htons(port);
 	connectState = bind(sockSrv, (SOCKADDR*)&addrSrv, sizeof(SOCKADDR));
 	if (connectState != 0) {
@@ -248,6 +333,7 @@ int main()
 	srand((unsigned)time(NULL));
 
 	cout << "服务器已启动，等待连接请求中..." << endl;
+	cout << "动     作" << "	" << "S/R" << "	" << "SEQ" << "	" << "ACK" << "	" << "校验和" << endl;
 	//LISTEN
 	//第一次握手
 	while (!establish())//循环监听直至收到请求
@@ -264,8 +350,48 @@ int main()
 	sendPackage();
 	cout << "连接已建立！" << endl;
 	//ESTABLISHED
+	//=====================================================STEP2: 发送文件==============================================================
+	for (auto filename : files) {
+		sendFile(filename);
+	}
+	//=====================================================STEP3: 断开连接==============================================================
+	sendBuf.reset(++seq, ack, true, false, true, nullptr, 0);
+	cout << "数据传输完毕，即将向客户端发送断连请求..." << endl;
+	//第一、二次挥手
+	sendPackage();
+	//FIN-WAIT2
+	int addrLen = sizeof(SOCKADDR);
+	int time = 0;
+	while (true) 
+	{
+		int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, &addrLen);
+		if (recvNum < 0) {//用户端下线
+			Sleep(500);
+			time++;
+			if (time > 30) {
+				break;
+			}
+			else continue;
+		}
+		if (!recvBuf.valid()) {//校验
+			cout << "接收消息有误！等待重传..." << endl;
+			continue;
+		}
+		if (recvBuf.getFIN()) {
+			cout << "第三次握手" << "	" << "R" << "	" << recvBuf.seq - ackBase << "	" << recvBuf.ack - seqBase << "	" << recvBuf.checkSum << endl;
+			ack = recvBuf.seq;
+			sendBuf.reset(seq + 1, ack, true, false, false, nullptr, 0);
+			if (!randomLoss()) {
+				sendto(sockSrv, (char*)&sendBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, addrLen);
+			}
+			cout << "第四次挥手" << "	" << "S" << "	" << sendBuf.seq - seqBase << "	" << sendBuf.ack - ackBase << "	" << sendBuf.checkSum << endl;
+			time = 0;
+		}
 
+	}
 	cout << "会话已结束" << endl;
+	closesocket(sockSrv);
+	WSACleanup();
 	system("pause");
 	return 0;
 }
