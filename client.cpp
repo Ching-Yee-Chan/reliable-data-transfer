@@ -10,7 +10,7 @@ SOCKADDR_IN addrClt;
 SOCKET sockClient;
 
 const int MSS = 2048;
-const double LOSSRATE = 0;
+const double LOSSRATE = 0.1;
 unsigned short seq = 0;
 unsigned short ack = 0;
 unsigned short seqBase = 0;
@@ -298,7 +298,7 @@ int main()
 			cout << "[error]接收消息有误！等待重传。。。" << endl;
 			continue;
 		}
-		if(recvBuf.getACK() && recvBuf.ack==seq+1){//第四次挥手信号。特征：ack = seq + 1
+		if(recvBuf.getACK() && false){//第四次挥手信号。特征：ack = seq + 1
 			cout<<"第四次挥手"<<"	"<<"R"<<"	" <<recvBuf.seq  - ackBase<< "	"<<recvBuf.ack - seqBase<<"	"<<recvBuf.checkSum<<endl;
 			break;
 		}
@@ -312,6 +312,7 @@ int main()
 		else if(outfile.is_open()){//正在接收文件
 			outfile.write(recvBuf.data, min(MSS, length));
 			length -= MSS;
+			ack = recvBuf.seq;//只有这里可以更新ack
 			cout<<"收     到"<<"	"<<"R"<<"	" <<recvBuf.seq  - ackBase<< "	"<<recvBuf.ack - seqBase<<"	"<<recvBuf.checkSum<<endl;
 			if(length<=0){//文件传输完毕
 				cout<<"文件传输完毕！"<<endl;
@@ -324,9 +325,9 @@ int main()
 			cout<<"文件"<<head->name<<"开始传输！"<<endl;
 			outfile.open(head->name, ios::binary);
 			length = head->length;
+			ack = recvBuf.seq;//此处仍是停等机制，更新ack
 		}
-		ack = recvBuf.seq;
-		sendBuf.reset(seq, recvBuf.seq, true, false, false, nullptr, 0);
+		sendBuf.reset(seq, ack, true, false, false, nullptr, 0);
 		if(!randomLoss()){//模拟丢包
 			sendto(sockClient, (char*)&sendBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrSrv, addrLen);
 		}
