@@ -9,10 +9,18 @@
 using namespace std;
 
 const int MSS = 2048;
-const double LOSSRATE = 0;
+const int TOTALWIN = 128;//发送窗口最大值
+const double LOSSRATE = 0.01;
 unsigned short seq = 0, ack = 0;
-unsigned short seqBase = 0;
-unsigned short ackBase = 0;
+unsigned short seqBase = 0;//服务器发送消息序列号的基准编号，用于计算基准序列号（ISN）
+unsigned short ackBase = 0;//ack基准（客户端ISN）
+unsigned short sendBase = 1;//发送窗口基址，0号为第二次握手使用
+bool over = false;//用于传输结束时停止接收进程
+bool retransmitting = false;//当接收线程正在重传时，为缓冲区上锁
+int window = 1;//实际发送窗口大小，初始为1
+int threhold = 32;//阈值大小，初始化为65536byte
+int ackNum = 0;//总共收到的ACK数量，供拥塞避免阶段使用
+int dupACKNum = 0;//冗余ACK数量，用于判断丢包
 SOCKADDR_IN addrSrv;
 SOCKADDR_IN addrClt;
 SOCKET sockSrv;
@@ -28,7 +36,7 @@ bool randomLoss()
 	return false;
 }
 
-struct stop_wait_package
+struct package
 {
 	unsigned short seq;
 	unsigned short ack;
@@ -95,14 +103,14 @@ struct stop_wait_package
 		pseudo[3] = 0;
 		pseudo[2] = 6;//tcp协议编号
 		//TCP长度
-		pseudo[1] = sizeof(stop_wait_package) >> 8;
-		pseudo[0] = sizeof(stop_wait_package);
+		pseudo[1] = sizeof(package) >> 8;
+		pseudo[0] = sizeof(package);
 		unsigned short sum = 0;
 		for (int i = 0; i < 12; i += 2)
 		{
 			sum = sum + *((unsigned short*)(pseudo + i));
 		}
-		for (int i = 0; i < sizeof(stop_wait_package); i += 2)
+		for (int i = 0; i < sizeof(package); i += 2)
 		{
 			sum = sum + *((unsigned short*)((char*)this + i));
 		}
@@ -124,20 +132,20 @@ struct stop_wait_package
 		pseudo[3] = 0;
 		pseudo[2] = 6;//tcp协议编号
 		//TCP长度
-		pseudo[1] = sizeof(stop_wait_package) >> 8;
-		pseudo[0] = sizeof(stop_wait_package);
+		pseudo[1] = sizeof(package) >> 8;
+		pseudo[0] = sizeof(package);
 		unsigned short sum = 0;
 		for (int i = 0; i < 12; i += 2)
 		{
 			sum = sum + *((unsigned short*)(pseudo + i));
 		}
-		for (int i = 0; i < sizeof(stop_wait_package); i += 2)
+		for (int i = 0; i < sizeof(package); i += 2)
 		{
 			sum = sum + *((unsigned short*)((char*)this + i));
 		}
 		return sum == 0xFFFF;
 	}
-}sendBuf, recvBuf;
+}sendBuf[TOTALWIN], recvBuf;
 
 //文件头结构
 struct fileHead {
@@ -182,7 +190,7 @@ sockaddr_in getLocalIP()
 bool establish()
 {
 	int len = sizeof(SOCKADDR);
-	int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, &len);
+	int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(package), 0, (SOCKADDR*)&addrClt, &len);
 	if (recvNum < 0) {
 		cout << "[error]接收建联请求失败，错误码：" << WSAGetLastError() << endl;
 		return false;
@@ -199,13 +207,14 @@ bool establish()
 	else return false;
 }
 
-bool sendPackage()
+//停等收发函数，仅在连接建立和释放时调用
+bool sendAndWait()
 {
 	while (true)
 	{
-		cout << "发     送" << "	" << "S" << "	" << sendBuf.seq - seqBase << "	" << sendBuf.ack - ackBase << "	" << sendBuf.checkSum << endl;
+		cout << "发     送" << "	" << "S" << "	" << sendBuf[seq % TOTALWIN].seq - seqBase << "	" << sendBuf[seq % TOTALWIN].ack - ackBase << "	" << sendBuf[seq % TOTALWIN].checkSum << endl;
 		if (!randomLoss()) {//模拟丢包
-			int status = sendto(sockSrv, (char*)&sendBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, sizeof(SOCKADDR));
+			int status = sendto(sockSrv, (char*)&sendBuf[seq % TOTALWIN], sizeof(package), 0, (SOCKADDR*)&addrClt, sizeof(SOCKADDR));
 			if (status == SOCKET_ERROR) {
 				cout << "[error]发送消息失败，即将重传！错误码：" << WSAGetLastError() << endl;
 				continue;
@@ -214,7 +223,7 @@ bool sendPackage()
 		for (int i = 0; i < 10; Sleep(5), i++)
 		{
 			int len = sizeof(SOCKADDR);
-			int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, &len);
+			int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(package), 0, (SOCKADDR*)&addrClt, &len);
 			if (recvNum < 0) {
 				continue;
 			}
@@ -222,8 +231,9 @@ bool sendPackage()
 				cout << "[error]接收消息有误！即将重传..." << endl;
 				break;
 			}
-			if (recvBuf.getACK() && recvBuf.ack==seq) {
+			if (recvBuf.getACK() && recvBuf.ack == seq) {
 				cout << "收     到" << "	" << "R" << "	" << recvBuf.seq - ackBase << "	" << recvBuf.ack - seqBase << "	" << recvBuf.checkSum << endl;
+				sendBase = recvBuf.ack + 1;
 				ack = recvBuf.seq;
 				return true;
 			}
@@ -245,31 +255,115 @@ bool sendFile(string fileName)
 	infile.seekg(0, ios::end);
 	int length = infile.tellg();
 	int packNum = ceil((double)length / MSS);
-	cout << "文件"<< fileName << "已读取！大小为" << length << "Bytes，共计" << packNum << "个数据包" << endl;
+	cout << "文件" << fileName << "已读取！大小为" << length << "Bytes，共计" << packNum << "个数据包" << endl;
 	//发送文件头
 	fileHead head;
 	strcpy_s(head.name, fileName.c_str());
 	head.length = length;
-	sendBuf.reset(++seq, ack, true, false, false, (char*)&head, sizeof(head));
-	sendPackage();
-	cout << "文件头发送成功！开始传输数据..."<<endl;
+	sendBuf[(++seq) % TOTALWIN].reset(seq, ack, true, false, false, (char*)&head, sizeof(head));
+	sendAndWait();
+	cout << "文件头发送成功！开始传输数据..." << endl;
 	infile.seekg(0, std::ios_base::beg);  //将文件流指针重新定位到流的开始
 	//传输文件
 	double time = 0;
-	for (int i = 1; length>0; length -= MSS, i++) {	//i计数，length记录剩余长度
-		//计时器开始
-		LARGE_INTEGER t1, t2, tc;
-		QueryPerformanceFrequency(&tc);
-		QueryPerformanceCounter(&t1);
-		infile.read(sendBuf.data, min(length, MSS));
-		sendBuf.reset(++seq, ack, true, false, false, nullptr, 0);//由于已经设置过data域，此处不再设置
-		sendPackage();
-		//计时器终止
-		QueryPerformanceCounter(&t2);
-		//cout << "第" << i << "个数据包已发送成功！" << endl;
-		time += (t2.QuadPart - t1.QuadPart) * 1.0 / tc.QuadPart;
+	while (length > 0) {
+		if (retransmitting || (seq - sendBase >= window - 1)) {//缓冲区上锁，正在重传，或缓冲区已满，等待
+			Sleep(10);
+			continue;
+		}
+		infile.read(sendBuf[(seq + 1) % TOTALWIN].data, min(length, MSS));//此处序列号前移
+		length -= MSS;
+		sendBuf[(seq + 1) % TOTALWIN].reset(seq + 1, ack, true, false, false, nullptr, 0);//由于已经设置过data域，此处不再设置
+		cout << "发    送" << "	" << "S" << "	" << sendBuf[(seq + 1) % TOTALWIN].seq - seqBase << "	" << sendBuf[(seq + 1) % TOTALWIN].ack - ackBase << "	" << sendBuf[(seq + 1) % TOTALWIN].checkSum << "	" << sendBase - seqBase << "	" << seq - seqBase << endl;
+		if (!randomLoss()) {
+			sendto(sockSrv, (char*)&sendBuf[(seq + 1) % TOTALWIN], sizeof(package), 0, (SOCKADDR*)&addrClt, sizeof(package));
+		}
+		seq++;
 	}
-	cout << "文件" << fileName << "传输完成！用时" << time << "s" << endl;
+	cout << "文件" << fileName << "传输完成！" << endl;
+}
+
+DWORD WINAPI recvACK(LPVOID lparam)
+{
+	while (true)
+	{
+		for (int i = 0; i < 10; i++)
+		{
+			if (over && sendBase == seq + 1) {
+				over = false;
+				return 1;//传输过程已结束，线程终止
+			}
+			int len = sizeof(SOCKADDR);
+			int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(package), 0, (SOCKADDR*)&addrClt, &len);
+			if (recvNum < 0 || !recvBuf.valid()) {//缓冲区为空或校验失败，继续计时
+				Sleep(5);
+				if (i == 9 && min(sendBase + window - 1, seq) >= sendBase) {//超时重传，慢开始
+					threhold = window / 2;
+					window = 1;
+					cout << "启动慢开始，窗口大小变为1" << endl;
+					dupACKNum = 0;
+					ackNum = 0;//执行新的窗口大小时，累计收到的ACK须清零
+				}
+				continue;
+			}
+			else if (sendBase == seq + 1) {//缓冲区为空，重新开始计时
+				i = 0;
+				Sleep(5);
+			}
+			else if (recvBuf.getACK() && recvBuf.ack >= sendBase) {//收到新ACK
+				cout << "收   到ACK" << "	" << "R" << "	" << recvBuf.seq - ackBase << "	" << recvBuf.ack - seqBase << "	" << recvBuf.checkSum << "	" << sendBase - seqBase << "	" << seq - seqBase << endl;
+				int recvACKNum = recvBuf.ack - sendBase + 1;//确认帧数
+				int oldMax = sendBase + window;//上次重传的下一个位置
+				if (window < threhold) {//window大小未达到阈值，采用慢开始算法
+					window += recvACKNum;
+					if (window > threhold) {//window已经超过threhold
+						ackNum = window - threhold;//超过部分累加进ackNum
+						window = threhold;
+					}
+				}
+				else {//window大小超过阈值，采用拥塞避免算法
+					ackNum += recvACKNum;//累加收到的ACK
+					if (ackNum >= window) {//经过一个RTT，线性加
+						ackNum -= window;
+						window++;
+					}
+				}
+				sendBase = recvBuf.ack + 1;
+				if (sendBase+window -1 <=seq) {//缓冲区此时不为空，将剩余的缓冲发送出去
+					for (int i = oldMax; i <= min(sendBase + window - 1, seq); i++) {//遍历新加入窗口的所有缓冲块并发送之
+						cout << "重    传" << "	" << "S" << "	" << sendBuf[i % TOTALWIN].seq - seqBase << "	" << sendBuf[i % TOTALWIN].ack - ackBase << "	" << sendBuf[i % TOTALWIN].checkSum << "	" << sendBase - seqBase << "	" << seq - seqBase << endl;
+						if (!randomLoss()) {//模拟丢包
+							sendto(sockSrv, (char*)&sendBuf[i % TOTALWIN], sizeof(package), 0, (SOCKADDR*)&addrClt, sizeof(package));
+						}
+					}
+				}
+				i = 0;//计时器重新开始计时
+				dupACKNum = 1;//重新开始记录重复ACK数量
+			}
+			else if (recvBuf.getACK() && recvBuf.ack < sendBase) {//收到冗余ACK
+				cout << "第" << ++dupACKNum <<"个冗余ACK" << "	" << "R" << "	" << recvBuf.seq - ackBase << "	" << recvBuf.ack - seqBase << "	" << recvBuf.checkSum << "	" << sendBase - seqBase << "	" << seq - seqBase << endl;
+				i = 0;
+				if (dupACKNum == 3) {//连续收到三个冗余ACK，认为丢包，重传
+					threhold = window / 2;
+					window = threhold;
+					cout << "启动快恢复，窗口大小变为" << window << endl;
+					ackNum = 0;//执行新的窗口大小时，累计收到的ACK须清零
+					break;//立即启动重传
+				}
+			}
+		}
+		if (min(sendBase + window - 1, seq) >= sendBase) {//缓冲区不为空
+			cout << "即将重传..." << endl;
+			retransmitting = true;//缓冲区上锁
+			for (int i = sendBase; i <= min(sendBase+window - 1, seq); i++) {//遍历在窗口内且在sendBase-seq之间的所有缓冲块并发送之
+				cout << "重    传" << "	" << "S" << "	" << sendBuf[i % TOTALWIN].seq - seqBase << "	" << sendBuf[i % TOTALWIN].ack - ackBase << "	" << sendBuf[i % TOTALWIN].checkSum << "	" << sendBase - seqBase << "	" << seq - seqBase << endl;
+				if (!randomLoss()) {//模拟丢包
+					sendto(sockSrv, (char*)&sendBuf[i % TOTALWIN], sizeof(package), 0, (SOCKADDR*)&addrClt, sizeof(package));
+				}
+			}
+			retransmitting = false;//缓冲区解锁
+		}
+	}
 }
 
 int main()
@@ -288,7 +382,7 @@ int main()
 		do {
 			if (strcmp(fileInfo.name, ".") && strcmp(fileInfo.name, "..")) {//过滤"."和".."
 				cout << "找到文件：" << fileInfo.name << endl;
- 				files.push_back(fileInfo.name);
+				files.push_back(fileInfo.name);
 			}
 		} while (_findnext(handle, &fileInfo) == 0);
 		_findclose(handle);
@@ -343,28 +437,34 @@ int main()
 	//设置套接字为非阻塞模式 
 	int iMode = 1; //1：非阻塞，0：阻塞 
 	ioctlsocket(sockSrv, FIONBIO, (u_long FAR*) & iMode);
-	seq = seqBase = rand();
-	sendBuf.reset(seq, ack, true, true, false, nullptr, 0);
+	seq = seqBase = sendBase = rand();
+	sendBuf[seq % TOTALWIN].reset(seq, ack, true, true, false, nullptr, 0);
 	//SYN-RCVD
 	//第二次、第三次握手
-	sendPackage();
+	sendAndWait();
 	cout << "连接已建立！" << endl;
 	//ESTABLISHED
 	//=====================================================STEP2: 发送文件==============================================================
 	for (auto filename : files) {
+		while (over) {//等待线程结束
+			Sleep(1);
+		}
+		DWORD dwThreadId;
+		HANDLE recvThread = CreateThread(NULL, NULL, recvACK, LPVOID(0), 0, &dwThreadId);
 		sendFile(filename);
+		over = true;
 	}
 	//=====================================================STEP3: 断开连接==============================================================
-	sendBuf.reset(++seq, ack, true, false, true, nullptr, 0);
+	sendBuf[(++seq) % TOTALWIN].reset(seq, ack, true, false, true, nullptr, 0);
 	cout << "数据传输完毕，即将向客户端发送断连请求..." << endl;
 	//第一、二次挥手
-	sendPackage();
+	sendAndWait();
 	//FIN-WAIT2
 	int addrLen = sizeof(SOCKADDR);
 	int time = 0;
-	while (true) 
+	while (true)
 	{
-		int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, &addrLen);
+		int recvNum = recvfrom(sockSrv, (char*)&recvBuf, sizeof(package), 0, (SOCKADDR*)&addrClt, &addrLen);
 		if (recvNum < 0) {//用户端下线
 			Sleep(500);
 			time++;
@@ -378,13 +478,13 @@ int main()
 			continue;
 		}
 		if (recvBuf.getFIN()) {
-			cout << "第三次握手" << "	" << "R" << "	" << recvBuf.seq - ackBase << "	" << recvBuf.ack - seqBase << "	" << recvBuf.checkSum << endl;
+			cout << "第三次挥手" << "	" << "R" << "	" << recvBuf.seq - ackBase << "	" << recvBuf.ack - seqBase << "	" << recvBuf.checkSum << endl;
 			ack = recvBuf.seq;
-			sendBuf.reset(seq + 1, ack, true, false, false, nullptr, 0);
+			sendBuf[(seq + 1) % TOTALWIN].reset(seq, ack, true, false, false, nullptr, 0);
 			if (!randomLoss()) {
-				sendto(sockSrv, (char*)&sendBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrClt, addrLen);
+				sendto(sockSrv, (char*)&sendBuf[(seq + 1) % TOTALWIN], sizeof(package), 0, (SOCKADDR*)&addrClt, addrLen);
 			}
-			cout << "第四次挥手" << "	" << "S" << "	" << sendBuf.seq - seqBase << "	" << sendBuf.ack - ackBase << "	" << sendBuf.checkSum << endl;
+			cout << "第四次挥手" << "	" << "S" << "	" << sendBuf[seq % TOTALWIN].seq - seqBase << "	" << sendBuf[seq % TOTALWIN].ack - ackBase << "	" << sendBuf[seq % TOTALWIN].checkSum << endl;
 			time = 0;
 		}
 
