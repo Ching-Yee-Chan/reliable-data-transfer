@@ -10,13 +10,14 @@ SOCKADDR_IN addrClt;
 SOCKET sockClient;
 
 const int MSS = 2048;
-const double LOSSRATE = 0.1;
+const double LOSSRATE = 0;
 unsigned short seq = 0;
 unsigned short ack = 0;
 unsigned short seqBase = 0;
 unsigned short ackBase = 0;
 ofstream outfile;//输出文件流
 int length = 0;//文件剩余长度
+int finSeq = -1;//第三次挥手的序列号
 
 sockaddr_in getLocalIP()
 {
@@ -226,7 +227,7 @@ DWORD WINAPI finalize(LPVOID lparam)
 {
 	while (true)
 	{
-		sendBuf.reset(seq+1, ack, true, false, true, nullptr, 0);
+		sendBuf.reset(seq, ack, true, false, true, nullptr, 0);
 		cout<<"第三次挥手"<<"	"<<"S"<<"	" <<sendBuf.seq - seqBase<< "	"<<sendBuf.ack - ackBase<<"	"<<sendBuf.checkSum<<endl;
 		if (!randomLoss()) {//模拟丢包
 			int status = sendto(sockClient, (char*)&sendBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrSrv, sizeof(SOCKADDR));
@@ -298,12 +299,13 @@ int main()
 			cout << "[error]接收消息有误！等待重传。。。" << endl;
 			continue;
 		}
-		if(recvBuf.getACK() && false){//第四次挥手信号。特征：ack = seq + 1
+		if(recvBuf.getACK() && recvBuf.ack == finSeq){//第四次挥手信号。特征：ack = seq + 1
 			cout<<"第四次挥手"<<"	"<<"R"<<"	" <<recvBuf.seq  - ackBase<< "	"<<recvBuf.ack - seqBase<<"	"<<recvBuf.checkSum<<endl;
 			break;
 		}
 		if(recvBuf.getFIN()){//第一次挥手
 			cout<<"第一次挥手"<<"	"<<"R"<<"	" <<recvBuf.seq  - ackBase<< "	"<<recvBuf.ack - seqBase<<"	"<<recvBuf.checkSum<<endl;
+			ack = recvBuf.seq;
 		}
 		else if(recvBuf.seq!=ack+1){//乱序，直接丢弃
 			cout<<"收到冗余包"<<"	"<<"R"<<"	" <<recvBuf.seq  - ackBase<< "	"<<recvBuf.ack - seqBase<<"	"<<recvBuf.checkSum<<endl;
@@ -332,7 +334,8 @@ int main()
 			sendto(sockClient, (char*)&sendBuf, sizeof(stop_wait_package), 0, (SOCKADDR*)&addrSrv, addrLen);
 		}
 		cout<<"确     认"<<"	"<<"S"<<"	" <<sendBuf.seq  - seqBase<< "	"<<sendBuf.ack - ackBase<<"	"<<sendBuf.checkSum<<endl;
-		if(recvBuf.getFIN()){//启动第三次挥手线程
+		if(recvBuf.getFIN() && finSeq < 0){//启动第三次挥手线程
+			finSeq = ++seq;//设置第三次挥手的序列号
 			DWORD dwThreadId;
 			HANDLE recvThread = CreateThread(NULL, NULL, finalize, LPVOID(0), 0, &dwThreadId);
 		}
